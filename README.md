@@ -17,12 +17,13 @@ What does it do?
 * Small files are tarred together (You can define the large/small threshold in the configuration)
 * If there is an unexpected error all the files processed so far are uploaded and you can just restart the program again.
 * When all the files are processed - uploads the sqlite3 database to glacier as well.
+* If there is a problem while uploading to glacier it sleeps for 10 seconds then retries.
 
 What it doesn't do (yet)
 ------------------------
 
 * Nice output / Progress information / UI
-* Handle timeouts / connection errors - you need to manually restart the program
+* Exclude filters - allow to exclude certain files based on extension/name/glob/regex
 * Restore - should be easy to implement, basically should do the following:
     * get the vault inventory
     * download the last sqlite3 db (the archive description contains an identifier and a timestamp)

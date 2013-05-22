@@ -1,7 +1,9 @@
 # coding: utf-8
 
 import os
+import time
 import sys
+import traceback
 import sqlite3
 import logging
 import hashlib
@@ -32,6 +34,19 @@ def _enableBotoDebugLogging():
     logger.level = logging.DEBUG
     logger.addHandler(logging.StreamHandler(sys.stdout))
 
+def _uploadArchiveAutoRetry(vault,fname,description):
+    try:
+        return vault.upload_archive(fname,description)
+    except KeyboardInterrupt:
+        raise
+    except:
+        print("Unexpected error")
+        traceback.print_exc()
+        print("retrying after 10 seconds")
+        time.sleep(10)
+        print("retrying...")
+        return _uploadArchiveAutoRetry(vault,fname,description)
+    
 class Main():
     def _parseConfig(self,configpath):
         data={
@@ -120,7 +135,7 @@ class Main():
         )
         self._glacier_vault=self._glacier_connection.create_vault(self._profile['vault_name'])
 
-    def _get_archive_id(self,fname):
+    def _get_archive_id(self,fname,fsize):
         fhash=_filehash(fname)
         cur=self._db.cursor()
         cur.execute("""
@@ -132,8 +147,8 @@ class Main():
             print('hash already exists, no upload necessary')
             archive_id=data[0][0]
         else:
-            print('uploading to glacier')
-            archive_id = self._glacier_vault.upload_archive(fname,fhash)
+            print('uploading to glacier (%s bytes)'%str(fsize))
+            archive_id = _uploadArchiveAutoRetry(self._glacier_vault,fname,fhash)
             #archive_id = 'fake'
             print('inserting into hashes (archive_id=%s)'%archive_id)
             cur.execute("""
@@ -171,21 +186,17 @@ class Main():
         need_insert=False
         need_update=False
         data=cur.fetchall()
-        sys.stdout.write('.')
-        sys.stdout.flush()
         if len(data)==0:
             need_insert=True
-            print("\nnew file")
         elif len(data)>0 and (data[0][0]!=fmtime or data[0][1]!=fsize):
             need_update=True
-            print("\nupdated file")
         return (need_insert,need_update)
     
     def _flush_profile_tar(self):
         if len(self._profile_current_tar)==1:
             print("\ntar only contains 1 file - uploading directly")
             (need_insert,need_update,basepath,relfname,fname,fmtime,fsize)=self._profile_current_tar[0]
-            archive_id=self._get_archive_id(fname)
+            archive_id=self._get_archive_id(fname,fsize)
             if need_insert:
                 self._insert_file(basepath,relfname,fmtime,fsize,archive_id)
             if need_update:
@@ -199,9 +210,10 @@ class Main():
             with tarfile.open(tempfname, "w") as tar:
                 for need_insert,need_update,basepath,relfname,fname,fmtime,fsize in self._profile_current_tar:
                     tar.add(fname)
-            tempfmtime=os.path.getmtime(fname)
-            archive_id=self._get_archive_id(fname)
-            os.unlink(fname)
+            tempfmtime=os.path.getmtime(tempfname)
+            tempfsize=os.path.getsize(tempfname)
+            archive_id=self._get_archive_id(tempfname,tempfsize)
+            os.unlink(tempfname)
             cur=self._db.cursor()
             cur.execute("""
                 insert into glaciersync_tars (archive_id, mtime)
@@ -211,10 +223,10 @@ class Main():
             self._db.commit()
             for need_insert,need_update,basepath,relfname,fname,fmtime,fsize in self._profile_current_tar:
                 if need_insert:
-                    print("insert file")
+                    print("insert file (part of tar file)")
                     self._insert_file(basepath,relfname,fmtime,fsize,'')
                 if need_update:
-                    print("update file")
+                    print("update file (part of tar file)")
                     self._update_file(basepath,relfname,fmtime,fsize,'')
                 cur.execute("""
                     select rowid from glaciersync_files
@@ -232,10 +244,6 @@ class Main():
             self._any_changes=True
 
     def _process_tar_file(self,need_insert,need_update,basepath,relfname,fname,fmtime,fsize):
-        if need_insert:
-            print("\nnew file delayed for tar")
-        else:
-            print("\nupdated file delayed for tar")
         self._profile_current_tar_size=self._profile_current_tar_size+fsize
         self._profile_current_tar.append((need_insert,need_update,basepath,relfname,fname,fmtime,fsize))
         if self._profile_current_tar_size>self._byte_threshold:
@@ -249,15 +257,23 @@ class Main():
         if need_insert or need_update:
             if fsize<=self._byte_threshold:
                 self._process_tar_file(need_insert,need_update,basepath,relfname,fname,fmtime,fsize)
+                sys.stdout.write('t')
+                sys.stdout.flush()
             else:
-                archive_id=self._get_archive_id(fname)
+                if need_insert:
+                    print("\nnew file")
+                if need_update:
+                    print("\nupdated file")
+                archive_id=self._get_archive_id(fname,fsize)
                 if need_insert:
                     self._insert_file(basepath,relfname,fmtime,fsize,archive_id)
                 if need_update:
                     self._update_file(basepath,relfname,fmtime,fsize,archive_id)
             self._any_changes=True
-            print('done')
-        
+        else:
+            sys.stdout.write('.')
+            sys.stdout.flush()
+            
     def _walk_path(self,basepath):
         print('#### processing path "%s"'%basepath)
         basepath=unicode(basepath)
@@ -272,7 +288,7 @@ class Main():
             self._config['database_dir'],
             self._profile_name+'.sqlite3'
         ))
-        archive_id = self._glacier_vault.upload_archive(fname,archive_description)
+        archive_id = _uploadArchiveAutoRetry(self._glacier_vault,fname,archive_description)
         #archive_id = 'fake'
         print('db archive id = %s'%archive_id)
     
